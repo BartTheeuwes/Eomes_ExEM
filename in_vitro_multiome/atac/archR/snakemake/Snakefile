@@ -1,0 +1,612 @@
+import os
+from re import search
+import getpass
+
+
+############
+## Config ##
+############
+configfile: "config.yaml"
+
+#################
+## Constraints ## -> super annoying
+#################
+# Really weird quirk in Snakemake that I don't understand, but without this some rules will pick wildcards from others
+wildcard_constraints:
+    matrix = '|'.join([re.escape(x) for x in config["dimensionality_reduction_TileMatrix"]["matrix"]]),
+    matrix2 = '|'.join([re.escape(x) for x in config["save_atac_matrices"]["matrices"]]),
+    matrix3 = '|'.join([re.escape(x) for x in config["dimensionality_reduction_PeakMatrix"]["matrix"]]),
+    matrix4 = '|'.join([re.escape(x) for x in config["pseudobulk"]["matrix"]]),
+    matrix5 = '|'.join([re.escape(x) for x in config["calculate_feature_stats"]["matrix"]])
+    
+###########
+## Rules ##
+###########
+
+rule all:
+    input:
+        # Basic archR processing
+        expand(config["directories"]["archr_directory"]+"/{sample}.arrow", sample=config["samples"]),
+        config["directories"]["archr_directory"]+"/Save-ArchR-Project.rds",
+        config["directories"]["archr_directory"]+"/sample_metadata_after_archR.txt.gz",
+
+        # QC
+        config["directories"]["results"]+"/qc/sample_metadata_after_qc.txt.gz",
+        config["directories"]["archr_directory"]+"/projectMetadata.rds",  # output of add_group_coverage
+        
+        # dimensionality_reduction_TileMatrix
+         expand(config["directories"]["results"]+"/dimensionality_reduction/cells/{matrix}/remove_ExE_cells_{remove_ExE_cells}/batch_correction_{batch_variable}/lsi_nfeatures{nfeatures}_dims{ndims}.rds",
+            matrix = config["dimensionality_reduction_TileMatrix"]["matrix"],
+            remove_ExE_cells = config["dimensionality_reduction_TileMatrix"]["remove_ExE_cells"],
+            nfeatures = config["dimensionality_reduction_TileMatrix"]["nfeatures"],
+            ndims = config["dimensionality_reduction_TileMatrix"]["ndims"],
+            batch_variable = config["dimensionality_reduction_TileMatrix"]["batch_variable"]
+         ),
+         
+        # archR_clustering_TileMatrix
+        config["directories"]["results"]+"/qc/sample_metadata_update_TileClusters.txt.gz",
+        
+        # Peak calling
+        config["directories"]["archr_directory"]+"/PeakCalls/PeakSet.rds",
+
+        # add custom peakset
+        expand(config["directories"]["archr_directory"] + "/PeakCalls/manual/{peakset_name}.rds", 
+             peakset_name=config["add_custom_peakset"]["peakset_name"]),
+         
+        # Gene scores
+        config["directories"]["archr_directory"]+"/addGeneScoreMatrix_completed.txt",
+
+        # Background peaks
+        config["directories"]["archr_directory"]+"/Background-Peaks.rds",
+
+        # TF motif annotations
+        config["directories"]["archr_directory"]+"/Annotations/peakAnnotation.rds",
+        
+        # chromVAR cells
+        expand(config["directories"]["results"] + "/chromvar/cells/chromVAR_deviations_{motif_annotation}_archr.rds", 
+             motif_annotation = config["run_chromvar_cells"]["motif_annotation"]),
+             
+        # export ATAC matrices
+        expand(config["directories"]["archr_directory"] + "/Matrices/{matrix2}_summarized_experiment.rds", 
+            matrix2=config["save_atac_matrices"]["matrices"]),             
+            
+        # dimensionality_reduction_PeakMatrix
+        expand(config["directories"]["results"]+"/dimensionality_reduction/cells/{matrix3}/remove_ExE_cells_{remove_ExE_cells}/batch_correction_{batch_variable}/lsi_nfeatures{nfeatures}_dims{ndims}.rds",
+            matrix3 = config["dimensionality_reduction_PeakMatrix"]["matrix"],
+            remove_ExE_cells = config["dimensionality_reduction_PeakMatrix"]["remove_ExE_cells"],
+            nfeatures = config["dimensionality_reduction_PeakMatrix"]["nfeatures"],
+            ndims = config["dimensionality_reduction_PeakMatrix"]["ndims"],
+            batch_variable = config["dimensionality_reduction_PeakMatrix"]["batch_variable"]
+         ),
+         
+        # archR_clustering_PeakMatrix
+        config["directories"]["results"]+"/qc/sample_metadata_update_PeakClusters.txt.gz",
+            
+        # pseudobulk data matrices
+        expand(config["directories"]["results"]+"/pseudobulk/{pseudobulk_group_by}/{matrix4}/pseudobulk_{matrix4}_summarized_experiment.rds", 
+            pseudobulk_group_by = config["pseudobulk"]["group_by"], 
+            matrix4 = config["pseudobulk"]["matrix"]),
+
+        # calculate feature stats
+        expand(config["directories"]["results"] + "/feature_stats/{matrix5}/{matrix5}_{calculate_feature_stats_group_by}_stats.txt.gz",
+           calculate_feature_stats_group_by = config["calculate_feature_stats"]["group_by"],
+           matrix5 = config["calculate_feature_stats"]["matrix"])#,
+
+########################
+## Create arrow files ##
+########################
+
+rule create_arrow_files:
+    input:
+        script = config["scripts"]["create_arrow_files"],
+        fragments_files = expand(config["directories"]["original_data"]+"/{sample}/outs/atac_fragments.tsv.gz", sample=config["samples"])
+    output:
+        expand(config["directories"]["archr_directory"]+"/{sample}.arrow", sample=config["samples"])
+    params:
+        outdir = config["directories"]["archr_directory"],
+        samples = config["samples"],
+        genome = config["resources"]["genome"],
+        min_fragments = config["create_arrow_files"]["min_fragments"],
+        max_fragments = config["create_arrow_files"]["max_fragments"],
+        min_tss_score = config["create_arrow_files"]["min_tss_score"]
+    threads: 
+        config["slurm"]["create_arrow_files"]["threads"]
+    resources:
+        mem_mb = config["slurm"]["create_arrow_files"]["memory"]
+    log: 
+        "logs/create_arrow_files.log"
+    shell:
+        "Rscript {input.script}  --samples {params.samples} --fragments_files {input.fragments_files} --genome {params.genome} --min_fragments {params.min_fragments} \
+        --max_fragments {params.max_fragments} --min_tss_score {params.min_tss_score} --threads {threads} --outdir {params.outdir} > {log}"
+
+##########################
+## Create ArchR project ##
+##########################
+
+rule create_archr_project:
+    input:
+        script = config["scripts"]["create_archr_project"],
+        arrow_files = ancient(expand(rules.create_arrow_files.output, sample=config["samples"]))
+    output:
+        config["directories"]["archr_directory"]+"/Save-ArchR-Project.rds"
+    params:
+        genome = config["resources"]["genome"],
+        outdir = config["directories"]["archr_directory"]
+    threads: 
+        config["slurm"]["create_archr_project"]["threads"]
+    resources:
+        mem_mb = config["slurm"]["create_archr_project"]["memory"]
+    log: 
+        "logs/create_archr_project.log"
+    shell:
+        "Rscript {input.script} --arrow_files {input.arrow_files} --genome {params.genome} --outdir {params.outdir} > {log}"
+
+
+###########################
+## Create ArchR metadata ##
+###########################
+
+rule create_archr_metadata:
+    input:
+        script = config["scripts"]["create_archr_metadata"],
+        metadata = config["files"]["rna_metadata"],
+        archr_project = ancient(rules.create_archr_project.output) # this isnt really required, it's just to fix the rule order execution
+    output:
+        config["directories"]["archr_directory"]+"/sample_metadata_after_archR.txt.gz"
+    params:
+        archr_directory = config["directories"]["archr_directory"],
+        genome = config["resources"]["genome"]
+    threads: 
+        config["slurm"]["create_archr_metadata"]["threads"]
+    resources:
+        mem_mb = config["slurm"]["create_archr_metadata"]["memory"]
+    log: 
+        "logs/create_archr_metadata.log"
+    shell:
+        "Rscript {input.script} --archr_directory {params.archr_directory} --metadata {input.metadata} --outfile {output} > {log}"
+
+
+########
+## QC ##
+########
+
+rule qc_archr:
+    input:
+        script = config["scripts"]["qc_archr"],
+        metadata = rules.create_archr_metadata.output
+    output:
+        config["directories"]["results"]+"/qc/qc_FragmentSizeDistribution.txt.gz",
+        config["directories"]["results"]+"/qc/qc_FragmentSizeDistribution.pdf",
+        config["directories"]["results"]+"/qc/qc_TSSenrichment.txt.gz",
+        config["directories"]["results"]+"/qc/qc_TSSenrichment.pdf",
+        config["directories"]["results"]+"/qc/qc_metrics_histogram.pdf",
+        config["directories"]["results"]+"/qc/qc_metrics_barplot.pdf",
+        metadata = config["directories"]["results"]+"/qc/sample_metadata_after_qc.txt.gz"
+    params:
+        archr_directory = config["directories"]["archr_directory"],
+        min_tss_enrichment = config["qc_archr"]["min_tss_enrichment"],
+        min_number_fragments = config["qc_archr"]["min_number_fragments"],
+        max_blacklist_ratio = config["qc_archr"]["max_blacklist_ratio"],
+        outdir = config["directories"]["results"]+"/qc"
+    threads: 
+        config["slurm"]["qc_archr"]["threads"]
+    resources:
+        mem_mb = config["slurm"]["qc_archr"]["memory"]
+    log: 
+        "logs/qc_archr.log"
+    shell:
+        "Rscript {input.script} --archr_directory {params.archr_directory} --metadata {input.metadata} --min_tss_enrichment {params.min_tss_enrichment} --min_number_fragments {params.min_number_fragments} \
+        --max_blacklist_ratio {params.max_blacklist_ratio} --threads {threads} --outdir {params.outdir} > {log}"
+
+
+#########################################
+## Dimensionality reduction TileMatrix ##
+#########################################
+
+rule dimensionality_reduction_TileMatrix: 
+    input:
+        script = ancient(config["scripts"]["dimensionality_reduction_cells"]),
+        metadata = rules.qc_archr.output.metadata
+    output:
+         lsi = config["directories"]["results"]+"/dimensionality_reduction/cells/{matrix}/remove_ExE_cells_{remove_ExE_cells}/batch_correction_{batch_variable}/lsi_nfeatures{nfeatures}_dims{ndims}.rds"
+    params:
+        seed = 42,
+        matrix = config["dimensionality_reduction_TileMatrix"]["matrix"],
+        lsi_iterations = config["dimensionality_reduction_TileMatrix"]["lsi_iterations"],
+        remove_ExE_cells = config["dimensionality_reduction_TileMatrix"]["remove_ExE_cells"],
+        nfeatures = config["dimensionality_reduction_TileMatrix"]["nfeatures"],
+        ndims = config["dimensionality_reduction_TileMatrix"]["ndims"],
+        batch_variable = config["dimensionality_reduction_TileMatrix"]["batch_variable"],
+        batch_method = config["dimensionality_reduction_TileMatrix"]["batch_method"],
+        n_neighbors = config["dimensionality_reduction_TileMatrix"]["n_neighbors"],
+        min_dist = config["dimensionality_reduction_TileMatrix"]["min_dist"], 
+        colour_by = config["dimensionality_reduction_TileMatrix"]["colour_by"],
+        outdir = config["directories"]["results"] + "/dimensionality_reduction/cells"
+    threads: 
+        config["slurm"]["dimensionality_reduction"]["threads"]
+    resources:
+        mem_mb = config["slurm"]["dimensionality_reduction"]["memory"]
+    log: 
+        "logs/umap_{matrix}_remove_ExE_cells_{remove_ExE_cells}_batch_correction_{batch_variable}_umap_nfeatures{nfeatures}_dims{ndims}.log"
+    shell:
+        "Rscript {input.script} --metadata {input.metadata} --matrix {wildcards.matrix} --lsi_iterations {params.lsi_iterations} --remove_ExE_cells {wildcards.remove_ExE_cells} --nfeatures {wildcards.nfeatures} --ndims {wildcards.ndims} \
+            --batch_variable {wildcards.batch_variable} --batch_method {params.batch_method} \
+            --n_neighbors {params.n_neighbors} --min_dist {params.min_dist} --colour_by {params.colour_by} \
+            --seed {params.seed} --outdir {params.outdir} > {log}"
+
+###########################
+## Clustering TileMatrix ##
+###########################
+
+rule archR_clustering_TileMatrix:
+    input:
+        script = ancient(config["scripts"]["archR_clustering"]),
+        metadata = rules.qc_archr.output.metadata,
+        reduced_dim = expand(config["directories"]["results"]+"/dimensionality_reduction/cells/{matrix}/remove_ExE_cells_{remove_ExE_cells}/batch_correction_{batch_variable}/lsi_nfeatures{nfeatures}_dims{ndims}.rds",
+            matrix = config["dimensionality_reduction_TileMatrix"]["matrix"],
+            remove_ExE_cells = config["dimensionality_reduction_TileMatrix"]["remove_ExE_cells"],
+            nfeatures = config["dimensionality_reduction_TileMatrix"]["nfeatures"],
+            ndims = config["dimensionality_reduction_TileMatrix"]["ndims"],
+            batch_variable = config["dimensionality_reduction_TileMatrix"]["batch_variable"],
+            batch_method = config["dimensionality_reduction_TileMatrix"]["batch_method"]
+         )
+    output:
+        outfile = config["directories"]["results"]+"/qc/sample_metadata_update_TileClusters.txt.gz"
+    params:
+        matrix = config["archR_clustering_TileMatrix"]["matrix"],
+        cluster_resolution = config["archR_clustering_TileMatrix"]["cluster_resolution"]
+    threads: 
+       config["slurm"]["archR_clustering_TileMatrix"]["threads"]
+    resources:
+        mem_mb = config["slurm"]["archR_clustering_TileMatrix"]["memory"]
+    log: 
+        "logs/archR_clustering_TileMatrix.log"
+    shell:
+        "Rscript {input.script} --metadata {input.metadata} --reduced_dim {input.reduced_dim} --matrix {params.matrix}  --cluster_resolution {params.cluster_resolution} \
+         --outfile {output.outfile} > {log}"
+         
+################
+## Pseudobulk ## --> now on clusters/clusters_genotype instead of celltype
+################
+
+rule add_group_coverage:
+    input:
+        script = config["scripts"]["add_group_coverage"],
+        metadata = rules.archR_clustering_TileMatrix.output.outfile
+    output:
+        config["directories"]["archr_directory"]+"/projectMetadata.rds"
+    params:
+        archr_directory = config["directories"]["archr_directory"],
+        group_by = config["add_group_coverage"]["group_by"],
+        min_cells = config["add_group_coverage"]["min_cells"],
+        max_cells = config["add_group_coverage"]["max_cells"]
+    threads: 
+        config["slurm"]["add_group_coverage"]["threads"]
+    resources:
+        mem_mb = config["slurm"]["add_group_coverage"]["memory"]
+    log: 
+        "logs/add_group_coverage.log"
+    shell:
+        "Rscript {input.script} --archr_directory {params.archr_directory} --metadata {input.metadata} --group_by {params.group_by} --min_cells {params.min_cells} \
+        --max_cells {params.max_cells} --threads {threads} > {log}"
+
+##################
+## Peak calling ##
+##################
+
+rule peak_calling:
+    input:
+        script = config["scripts"]["peak_calling"],
+        group_coverage = rules.add_group_coverage.output,
+        metadata = rules.archR_clustering_TileMatrix.output.outfile
+    output:
+        rds = config["directories"]["archr_directory"]+"/PeakCalls/PeakSet.rds",
+        peak_metadata = config["directories"]["archr_directory"]+"/PeakCalls/peak_metadata.tsv.gz",
+        bed = config["directories"]["archr_directory"]+"/PeakCalls/peaks_archR_macs2.bed.gz"
+    params:
+        archr_directory = config["directories"]["archr_directory"],
+        group_by = config["peak_calling"]["group_by"],
+     #   pathToMacs2 = config["peak_calling"]["pathToMacs2"],
+        pvalue_cutoff = config["peak_calling"]["pvalue_cutoff"],
+        extend_summits = config["peak_calling"]["extend_summits"],
+        outdir = config["directories"]["archr_directory"]+"/PeakCalls"
+    threads:
+        config["slurm"]["peak_calling"]["threads"]
+    resources:
+        mem_mb = config["slurm"]["peak_calling"]["memory"]
+    log: 
+        "logs/peak_calling.log"
+    shell:
+        "Rscript {input.script} --archr_directory {params.archr_directory} --metadata {input.metadata}  \
+        --group_by {params.group_by} --pvalue_cutoff {params.pvalue_cutoff} --extend_summits {params.extend_summits} --threads {threads} > {log}" # --pathToMacs2 {params.pathToMacs2}
+
+####################
+## custom_peakset ##
+####################
+
+rule add_custom_peakset:
+    input:
+        script = config["scripts"]["add_custom_peakset"],
+        peak_set = config["add_custom_peakset"]["peak_set"],
+        order = rules.peak_calling.output
+    output:
+        rds = expand(config["directories"]["archr_directory"] + "/PeakCalls/manual/{peakset_name}.rds", peakset_name=config["add_custom_peakset"]["peakset_name"])
+    params:
+        outdir = config["directories"]["archr_directory"]+"/PeakCalls/manual",
+        peakset_name =  config["add_custom_peakset"]["peakset_name"]
+    threads:
+        config["slurm"]["add_custom_peakset"]["threads"]
+    resources:
+        mem_mb = config["slurm"]["add_custom_peakset"]["memory"]
+    log: 
+        "logs/add_custom_peakset.log"
+    shell:
+        "Rscript {input.script} --peak_set {input.peak_set} --peakset_name {params.peakset_name} --outdir {params.outdir} --threads {threads} > {log}"
+        
+
+            
+#####################
+## Add gene scores ##
+#####################
+
+rule add_gene_scores:
+    input:
+        #peak_calling = rules.peak_calling.output, # only to make sure that add_gene_scores is not executed at the same time as other rules (bad stuff happens)
+        script = config["scripts"]["add_gene_scores"],
+        order = rules.add_custom_peakset.output
+    output:
+        config["directories"]["archr_directory"]+"/addGeneScoreMatrix_completed.txt"
+    params:
+        archr_directory = config["directories"]["archr_directory"]
+    threads: 
+        config["slurm"]["add_gene_scores"]["threads"]
+    resources:
+        mem_mb = config["slurm"]["add_gene_scores"]["memory"]
+    log: 
+        "logs/gene_scores.log"
+    shell:
+        "Rscript {input.script} --archr_directory {params.archr_directory} --threads {threads} > {log}"
+
+##########################
+## Add background peaks ##
+##########################
+
+rule background_peaks:
+    input:
+        script = config["scripts"]["background_peaks"],
+        peaks = rules.peak_calling.output, 
+        order = rules.add_gene_scores.output
+    output:
+        config["directories"]["archr_directory"]+"/Background-Peaks.rds"
+    params:
+        method = config["background_peaks"]["method"],
+        number_background_peaks = config["background_peaks"]["number_background_peaks"]
+    threads: 
+        config["slurm"]["background_peaks"]["threads"]
+    resources:
+        mem_mb = config["slurm"]["background_peaks"]["memory"]
+    log: 
+        "logs/background_peaks.log"
+    shell:
+        "Rscript {input.script} --method {params.method} --number_background_peaks {params.number_background_peaks} \
+        --threads {threads} > {log}"
+
+
+##########################
+## Add motif annotation ##
+##########################
+
+rule add_motif_annotation:
+     input:
+         script = config["scripts"]["add_motif_annotation"],
+         peaks = rules.peak_calling.output, # or add_custom_peakset if custom peak set is better
+         metadata = rules.archR_clustering_TileMatrix.output.outfile,
+         order = rules.background_peaks.output
+     output:
+         config["directories"]["archr_directory"]+"/Annotations/peakAnnotation.rds"
+     threads:
+         config["slurm"]["add_motif_annotation"]["threads"]
+     resources:
+         mem_mb = config["slurm"]["add_motif_annotation"]["memory"]
+     log: 
+         "logs/add_motif_annotation.log"
+     shell:
+         "Rscript {input.script}  --metadata {input.metadata} --threads {threads} > {log}"
+
+##############
+## chromVAR ##
+##############
+
+# Note: motif annotations in chromvar_singlecells should be run sequentially, otherwise I/O error when modifying the arrowFiles
+# snakemake --cores 1 -j 1 --latency-wait 90 -p --cluster "sbatch -n {threads} --mem {resources.mem_mb}M
+rule run_chromvar_cells_CISBP:
+    input:
+        bgd_peaks = rules.background_peaks.output, 
+        script = config["scripts"]["run_chromvar_cells"],
+        peak_annotation = rules.add_motif_annotation.output, 
+        metadata = rules.archR_clustering_TileMatrix.output.outfile
+    output:
+        config["directories"]["results"] + "/chromvar/cells/chromVAR_deviations_CISBP_archr.rds"
+    params:
+        archr_directory = config["directories"]["archr_directory"],
+        outdir = config["directories"]["results"] + "/chromvar/cells",
+        motif_annotation = 'CISBP'
+    threads: 
+        config["slurm"]["run_chromvar_cells"]["threads"]
+    resources:
+        mem_mb = config["slurm"]["run_chromvar_cells"]["memory"]
+    log: 
+        "logs/run_chromvar_cells_CISBP.log"
+    shell:
+        "Rscript {input.script} --archr_directory {params.archr_directory} --metadata {input.metadata} --motif_annotation {params.motif_annotation} --outdir {params.outdir} \
+        --force --threads {threads} > {log} "
+        
+rule run_chromvar_cells_JASPAR:
+    input:
+        bgd_peaks = rules.background_peaks.output,  # only to make sure that this rule is not executed at the same time as other rules (bad stuff happens)
+        script = config["scripts"]["run_chromvar_cells"],
+        peak_annotation = rules.add_motif_annotation.output,
+        metadata = rules.archR_clustering_TileMatrix.output.outfile,
+        order = rules.run_chromvar_cells_CISBP.output
+    output:
+        config["directories"]["results"] + "/chromvar/cells/chromVAR_deviations_JASPAR_archr.rds"
+    params:
+        archr_directory = config["directories"]["archr_directory"],
+        outdir = config["directories"]["results"] + "/chromvar/cells",
+        motif_annotation = 'JASPAR'
+    threads: 
+        config["slurm"]["run_chromvar_cells"]["threads"]
+    resources:
+        mem_mb = config["slurm"]["run_chromvar_cells"]["memory"]
+    log: 
+        "logs/run_chromvar_cells_JASPAR.log"
+    shell:
+        "Rscript {input.script} --archr_directory {params.archr_directory} --metadata {input.metadata} --motif_annotation {params.motif_annotation} --outdir {params.outdir} \
+        --force --threads {threads} > {log} "
+          
+###################
+## Save matrices ##
+###################
+
+rule save_atac_matrices:
+    input:
+        script = config["scripts"]["save_atac_matrices"],
+        peak = rules.peak_calling.output,    # to make sure that PeakMatrix is created before this rule
+        genescore = rules.add_gene_scores.output, # to make sure that GeneScoreMatrix is created before this rule
+        atlas = rules.add_custom_peakset.output, # to make sure that custom peakMatrix is created before this rule
+        metadata = rules.archR_clustering_TileMatrix.output.outfile,
+        order = rules.run_chromvar_cells_JASPAR.output
+    output:
+        config["directories"]["archr_directory"] + "/Matrices/{matrix2}_summarized_experiment.rds"
+    params:
+        archr_directory = config["directories"]["archr_directory"]
+    threads: 
+        config["slurm"]["save_atac_matrices"]["threads"]
+    resources:
+        mem_mb = config["slurm"]["save_atac_matrices"]["memory"]
+    log: 
+        "logs/save_atac_matrices_{matrix2}.log"
+    shell:
+        "Rscript {input.script} --archr_directory {params.archr_directory} --metadata {input.metadata} --matrix {wildcards.matrix2} --outfile {output} > {log}"
+
+#########################################
+## Dimensionality reduction PeakMatrix ##
+#########################################
+
+rule dimensionality_reduction_PeakMatrix: 
+    input:
+        script = config["scripts"]["dimensionality_reduction_cells"],
+        metadata = rules.archR_clustering_TileMatrix.output.outfile,
+        order = expand(config["directories"]["archr_directory"] + "/Matrices/{matrix2}_summarized_experiment.rds", 
+            matrix2=config["save_atac_matrices"]["matrices"])
+    output:
+         lsi = config["directories"]["results"]+"/dimensionality_reduction/cells/{matrix3}/remove_ExE_cells_{remove_ExE_cells}/batch_correction_{batch_variable}/lsi_nfeatures{nfeatures}_dims{ndims}.rds"
+    params:
+        seed = 42,
+        matrix = config["dimensionality_reduction_PeakMatrix"]["matrix"],
+        lsi_iterations = config["dimensionality_reduction_PeakMatrix"]["lsi_iterations"],
+        remove_ExE_cells = config["dimensionality_reduction_PeakMatrix"]["remove_ExE_cells"],
+        nfeatures = config["dimensionality_reduction_PeakMatrix"]["nfeatures"],
+        ndims = config["dimensionality_reduction_PeakMatrix"]["ndims"],
+        batch_variable = config["dimensionality_reduction_PeakMatrix"]["batch_variable"],
+        batch_method = config["dimensionality_reduction_PeakMatrix"]["batch_method"],
+        n_neighbors = config["dimensionality_reduction_PeakMatrix"]["n_neighbors"],
+        min_dist = config["dimensionality_reduction_PeakMatrix"]["min_dist"], 
+        colour_by = config["dimensionality_reduction_PeakMatrix"]["colour_by"],
+        outdir = config["directories"]["results"] + "/dimensionality_reduction/cells"
+    threads: 
+        config["slurm"]["dimensionality_reduction"]["threads"]
+    resources:
+        mem_mb = config["slurm"]["dimensionality_reduction"]["memory"]
+    log: 
+        "logs/umap_{matrix3}_remove_ExE_cells_{remove_ExE_cells}_batch_correction_{batch_variable}_umap_nfeatures{nfeatures}_dims{ndims}.log"
+    shell:
+        "Rscript {input.script} --metadata {input.metadata} --matrix {wildcards.matrix3} --lsi_iterations {params.lsi_iterations} --remove_ExE_cells {wildcards.remove_ExE_cells} --nfeatures {wildcards.nfeatures} --ndims {wildcards.ndims} \
+            --batch_variable {wildcards.batch_variable} --batch_method {params.batch_method} \
+            --n_neighbors {params.n_neighbors} --min_dist {params.min_dist} --colour_by {params.colour_by} \
+            --seed {params.seed} --outdir {params.outdir} > {log}"
+
+###########################
+## Clustering PeakMatrix ##
+###########################
+# Update input file to whichever peakmatrix LSI you want to use
+
+rule archR_clustering_PeakMatrix:
+    input:
+        script = config["scripts"]["archR_clustering"],
+        metadata = rules.archR_clustering_TileMatrix.output.outfile,
+        reduced_dim = expand(config["directories"]["results"]+"/dimensionality_reduction/cells/{matrix3}/remove_ExE_cells_{remove_ExE_cells}/batch_correction_{batch_variable}/lsi_nfeatures{nfeatures}_dims{ndims}.rds",
+            matrix3 = 'PeakMatrix',
+            remove_ExE_cells = 'FALSE',
+            nfeatures = 25000,
+            ndims = 20,
+            batch_variable = 'None'
+         )
+    output:
+        outfile = config["directories"]["results"]+"/qc/sample_metadata_update_PeakClusters.txt.gz"#, 
+        #completed = config["directories"]["results"]+"/qc/sample_metadata_update_PeakMatrix_completed.txt.gz"
+    params:
+        matrix = config["archR_clustering_PeakMatrix"]["matrix"],
+        cluster_resolution = config["archR_clustering_PeakMatrix"]["cluster_resolution"]
+    threads: 
+       config["slurm"]["archR_clustering_TileMatrix"]["threads"]
+    resources:
+        mem_mb = config["slurm"]["archR_clustering_TileMatrix"]["memory"]
+    log: 
+        "logs/archR_clustering_PeakMatrix.log"
+    shell:
+        "Rscript {input.script} --metadata {input.metadata} --reduced_dim {input.reduced_dim} --matrix {params.matrix}  --cluster_resolution {params.cluster_resolution} \
+         --outfile {output.outfile} > {log}" 
+
+##############################
+## Pseudobulk data matrices ##
+##############################
+
+rule pseudobulk:
+    input:
+        #atac_matrix_file = rules.save_atac_matrices.output, # this is done to make sure that pseudobulk is executed after the matrices are obtained
+        atac_matrix_file = expand(config["directories"]["archr_directory"] + "/Matrices/{matrix4}_summarized_experiment.rds", 
+            matrix4=config["pseudobulk"]["matrix"]), # only need the relevant output files
+        script = config["scripts"]["pseudobulk"],
+        metadata = rules.archR_clustering_PeakMatrix.output.outfile
+    output:
+        se = config["directories"]["results"] + "/pseudobulk/{pseudobulk_group_by}/{matrix4}/pseudobulk_{matrix4}_summarized_experiment.rds",
+        stats = config["directories"]["results"] + "/pseudobulk/{pseudobulk_group_by}/{matrix4}/stats.txt"
+    params:
+        archr_directory = config["directories"]["archr_directory"],
+        outdir = config["directories"]["results"] + "/pseudobulk/{pseudobulk_group_by}/{matrix4}"
+    threads: 
+        config["slurm"]["pseudobulk"]["threads"]
+    resources:
+        mem_mb = config["slurm"]["pseudobulk"]["memory"]
+    log: 
+        "logs/pseudobulk_by_{pseudobulk_group_by}_{matrix4}.log"
+    shell:
+        "Rscript {input.script} --archr_directory {params.archr_directory} --metadata {input.metadata} --group_by {wildcards.pseudobulk_group_by} --matrices {wildcards.matrix4} \
+        --outdir {params.outdir} --threads {threads} > {log}"
+        
+#############################
+## Calculate feature stats ##
+#############################
+
+rule calculate_feature_stats:
+    input:
+        script = config["scripts"]["calculate_feature_stats"],
+        cells_metadata = rules.archR_clustering_PeakMatrix.output.outfile,
+        atac_matrix_cells = expand(config["directories"]["archr_directory"] + "/Matrices/{matrix5}_summarized_experiment.rds", 
+            matrix5=config["calculate_feature_stats"]["matrix"]),
+        atac_matrix_pseudobulk = expand(config["directories"]["results"] + "/pseudobulk/{pseudobulk_group_by}/{matrix5}/pseudobulk_{matrix5}_summarized_experiment.rds",
+            pseudobulk_group_by=config["calculate_feature_stats"]["group_by"], 
+            matrix5=config["calculate_feature_stats"]["matrix"])
+    output:
+        config["directories"]["results"] + "/feature_stats/{matrix5}/{matrix5}_{calculate_feature_stats_group_by}_stats.txt.gz"
+    threads: 
+        config["slurm"]["calculate_feature_stats"]["threads"]
+    resources:
+        mem_mb = config["slurm"]["calculate_feature_stats"]["memory"]
+    log: 
+        "logs/calculate_feature_stats_{matrix5}_{calculate_feature_stats_group_by}.log"
+    shell:
+        "Rscript {input.script} --cells_metadata {input.cells_metadata} --matrix {wildcards.matrix5} \
+        --atac_matrix_cells {input.atac_matrix_cells} --atac_matrix_pseudobulk {input.atac_matrix_pseudobulk} \
+        --group_by {wildcards.calculate_feature_stats_group_by} --ignore_small_groups --outfile {output} > {log}"
